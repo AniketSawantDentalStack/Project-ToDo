@@ -1,0 +1,73 @@
+name: Deploy Frontend to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  ECR_REPOSITORY: thetheatreproject
+  CONTAINER_NAME: todo-interactive-frontend
+  HOST_PORT: '80'
+  CONTAINER_PORT: '80'
+  VITE_API_BASE_URL: 'http://${{ secrets.EC2_HOST }}:8080'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f frontend/Dockerfile \
+            --build-arg VITE_API_BASE_URL="$VITE_API_BASE_URL" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            frontend
+
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Deploy to EC2
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          printf '%s\n' '${{ secrets.EC2_SSH_KEY }}' > ec2_key.pem
+          chmod 600 ec2_key.pem
+
+          ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          ssh -o StrictHostKeyChecking=no -i ec2_key.pem ec2-user@${{ secrets.EC2_HOST }} "
+            set -e
+            sudo systemctl enable --now docker
+            echo '$ECR_PASSWORD' | sudo docker login --username AWS --password-stdin $ECR_REGISTRY
+            sudo docker pull $IMAGE_URI
+            sudo docker rm -f $CONTAINER_NAME || true
+            sudo docker run -d \
+              --name $CONTAINER_NAME \
+              --restart always \
+              -p $HOST_PORT:$CONTAINER_PORT \
+              $IMAGE_URI
+          "
